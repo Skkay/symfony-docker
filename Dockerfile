@@ -22,26 +22,47 @@ ENV APP_ENV=prod
 
 WORKDIR /srv/app
 
-# php extensions installer: https://github.com/mlocati/docker-php-extension-installer
-ADD https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions /usr/local/bin/
-RUN chmod +x /usr/local/bin/install-php-extensions
-
 # persistent / runtime deps
 RUN apk add --no-cache \
-		acl \
-		fcgi \
-		file \
-		gettext \
-		git \
-	;
+        acl \
+        fcgi \
+        file \
+        gettext \
+        git \
+    ;
 
 RUN set -eux; \
-    install-php-extensions \
-    	intl \
-    	zip \
-    	apcu \
-		opcache \
-    ;
+    apk add --no-cache --virtual .build-deps \
+        $PHPIZE_DEPS \
+        icu-data-full \
+        icu-dev \
+        libzip-dev \
+        zlib-dev \
+    ; \
+    \
+    docker-php-ext-configure zip; \
+    docker-php-ext-install -j$(nproc) \
+        intl \
+        zip \
+    ; \
+    pecl install \
+        apcu \
+    ; \
+    pecl clear-cache; \
+    docker-php-ext-enable \
+        apcu \
+        opcache \
+    ; \
+    \
+    runDeps="$( \
+        scanelf --needed --nobanner --format '%n#p' --recursive /usr/local/lib/php/extensions \
+            | tr ',' '\n' \
+            | sort -u \
+            | awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
+    )"; \
+    apk add --no-cache --virtual .app-phpexts-rundeps $runDeps; \
+    \
+    apk del .build-deps
 
 ###> recipes ###
 ###< recipes ###
@@ -74,8 +95,8 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 COPY composer.* symfony.* ./
 RUN set -eux; \
     if [ -f composer.json ]; then \
-		composer install --prefer-dist --no-dev --no-autoloader --no-scripts --no-progress; \
-		composer clear-cache; \
+        composer install --prefer-dist --no-dev --no-autoloader --no-scripts --no-progress; \
+        composer clear-cache; \
     fi
 
 # copy sources
@@ -83,12 +104,12 @@ COPY . .
 RUN rm -Rf docker/
 
 RUN set -eux; \
-	mkdir -p var/cache var/log; \
+    mkdir -p var/cache var/log; \
     if [ -f composer.json ]; then \
-		composer dump-autoload --classmap-authoritative --no-dev; \
-		composer dump-env prod; \
-		composer run-script --no-dev post-install-cmd; \
-		chmod +x bin/console; sync; \
+        composer dump-autoload --classmap-authoritative --no-dev; \
+        composer dump-env prod; \
+        composer run-script --no-dev post-install-cmd; \
+        chmod +x bin/console; sync; \
     fi
 
 # Dev image
@@ -98,30 +119,23 @@ ENV APP_ENV=dev XDEBUG_MODE=off
 VOLUME /srv/app/var/
 
 RUN rm $PHP_INI_DIR/conf.d/app.prod.ini; \
-	mv "$PHP_INI_DIR/php.ini" "$PHP_INI_DIR/php.ini-production"; \
-	mv "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
+    mv "$PHP_INI_DIR/php.ini" "$PHP_INI_DIR/php.ini-production"; \
+    mv "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
 
 COPY docker/php/conf.d/app.dev.ini $PHP_INI_DIR/conf.d/
 
 RUN set -eux; \
-	install-php-extensions xdebug
+    apk add --no-cache --virtual .build-deps $PHPIZE_DEPS; \
+    pecl install xdebug; \
+    docker-php-ext-enable xdebug; \
+    apk del .build-deps
 
 RUN rm -f .env.local.php
-
-# Build Caddy with the Mercure and Vulcain modules
-FROM caddy:${CADDY_VERSION}-builder-alpine AS app_caddy_builder
-
-RUN xcaddy build \
-	--with github.com/dunglas/mercure \
-	--with github.com/dunglas/mercure/caddy \
-	--with github.com/dunglas/vulcain \
-	--with github.com/dunglas/vulcain/caddy
 
 # Caddy image
 FROM caddy:${CADDY_VERSION} AS app_caddy
 
 WORKDIR /srv/app
 
-COPY --from=app_caddy_builder /usr/bin/caddy /usr/bin/caddy
 COPY --from=app_php /srv/app/public public/
 COPY docker/caddy/Caddyfile /etc/caddy/Caddyfile
